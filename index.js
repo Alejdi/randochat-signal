@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const PORT = process.env.PORT || 4000;
 const FALLBACK_MS = 10_000; // how long to wait for a same-country match before falling back to global
+const BAN_REFRESH_MS = 30_000;
 
 const supabase =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -34,8 +35,10 @@ const sessions = new Map();
 function logEvent(sid, type, extra = {}) {
   const meta = sessions.get(sid);
   const country = extra.country ?? meta?.country ?? null;
+  const ip = extra.ip ?? meta?.ip ?? null;
+  const username = extra.username ?? meta?.username ?? null;
   const duration_ms = extra.duration_ms ?? null;
-  console.log(`[event] ${type} sid=${sid} country=${country}${duration_ms != null ? ` dur=${duration_ms}ms` : ""}`);
+  console.log(`[event] ${type} sid=${sid} ip=${ip} country=${country} user=${username}${duration_ms != null ? ` dur=${duration_ms}ms` : ""}`);
   if (!supabase) return;
   supabase
     .from("events")
@@ -43,6 +46,8 @@ function logEvent(sid, type, extra = {}) {
       session_id: sid,
       type,
       country,
+      ip,
+      username,
       duration_ms,
       data: extra.data ?? null,
     })
@@ -57,6 +62,46 @@ function countryOf(socket) {
   if (!raw || raw === "XX" || raw === "T1") return null;
   return String(raw).toUpperCase().slice(0, 2);
 }
+
+function ipOf(socket) {
+  const h = socket.handshake.headers || {};
+  const raw =
+    h["cf-connecting-ip"] ||
+    (h["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+    h["x-real-ip"] ||
+    socket.handshake.address ||
+    null;
+  if (!raw) return null;
+  return String(raw).replace(/^::ffff:/, "").slice(0, 64) || null;
+}
+
+// ---- Ban list (in-memory, refreshed from Supabase) ----
+const banned = new Set();
+
+async function refreshBans() {
+  if (!supabase) return;
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("bans")
+    .select("ip, expires_at, active")
+    .eq("active", true);
+  if (error) {
+    console.error("[bans] refresh failed:", error.message);
+    return;
+  }
+  const next = new Set();
+  for (const row of data || []) {
+    if (!row.ip) continue;
+    if (row.expires_at && row.expires_at <= nowIso) continue;
+    next.add(row.ip);
+  }
+  banned.clear();
+  for (const ip of next) banned.add(ip);
+  console.log(`[bans] loaded ${banned.size} active ban(s)`);
+}
+
+refreshBans();
+setInterval(refreshBans, BAN_REFRESH_MS);
 
 function pair(a, b) {
   partners.set(a, b);
@@ -163,14 +208,34 @@ function broadcastPresence() {
 
 io.on("connection", (socket) => {
   const country = countryOf(socket);
+  const ip = ipOf(socket);
+
+  if (ip && banned.has(ip)) {
+    console.log(`[bans] rejecting banned ip=${ip}`);
+    socket.emit("banned", { reason: "Your access has been restricted." });
+    socket.disconnect(true);
+    return;
+  }
+
   sessions.set(socket.id, {
     country,
+    ip,
+    username: null,
     startedAt: Date.now(),
     matches: 0,
     skips: 0,
   });
-  logEvent(socket.id, "session_start", { country });
+  logEvent(socket.id, "session_start", { country, ip });
   broadcastPresence();
+
+  socket.on("hello", ({ username } = {}) => {
+    const meta = sessions.get(socket.id);
+    if (!meta) return;
+    const clean = typeof username === "string" ? username.trim().slice(0, 32) : null;
+    if (clean && /^[A-Za-z0-9_]+$/.test(clean)) {
+      meta.username = clean;
+    }
+  });
 
   socket.on("join-queue", () => {
     leavePartner(socket.id);
@@ -203,13 +268,16 @@ io.on("connection", (socket) => {
   });
 
   socket.on("report", async ({ peer, reason }) => {
+    const peerMeta = sessions.get(peer);
     const record = {
       reporter_sid: socket.id,
       reported_sid: peer,
       reason: String(reason || "").slice(0, 500),
+      reported_ip: peerMeta?.ip ?? null,
+      reported_username: peerMeta?.username ?? null,
     };
-    console.log(`[REPORT] ${record.reporter_sid} -> ${record.reported_sid}: ${record.reason}`);
-    logEvent(socket.id, "report", { data: { peer, reason: record.reason } });
+    console.log(`[REPORT] ${record.reporter_sid} -> ${record.reported_sid} (${record.reported_ip}): ${record.reason}`);
+    logEvent(socket.id, "report", { data: { peer, reason: record.reason, reported_ip: record.reported_ip } });
     if (!supabase) return;
     const { error } = await supabase.from("reports").insert(record);
     if (error) console.error("[randochat] report insert failed:", error.message);
@@ -236,4 +304,4 @@ io.on("connection", (socket) => {
   });
 });
 
-http.listen(PORT, () => console.log(`[randochat] signaling on :${PORT}`));
+http.listen(PORT, () => console.log(`[randochat] signaling on :${PORT} (supabase=${!!supabase})`));
