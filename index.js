@@ -165,17 +165,32 @@ function isBlocked(a, b) {
   return (blocks.get(a)?.has(b)) || (blocks.get(b)?.has(a));
 }
 
+function filterCompatible(meFilter, meCountry, otherFilter, otherCountry) {
+  // If I requested a specific country, the other user MUST be from there
+  if (meFilter && meFilter !== "any") {
+    if (!otherCountry || otherCountry !== meFilter) return false;
+  }
+  // Symmetric: if they requested a specific country, I must match it
+  if (otherFilter && otherFilter !== "any") {
+    if (!meCountry || meCountry !== otherFilter) return false;
+  }
+  return true;
+}
+
 function tryMatch(sid) {
   const meta = sessions.get(sid);
   const country = meta?.country || null;
+  const filter  = meta?.filter  || "any";
   const now = Date.now();
 
-  // Phase 1: same-country match (strict)
-  for (let i = 0; i < queue.length; i++) {
-    const other = queue[i];
-    if (other.sid === sid) continue;
-    if (isBlocked(sid, other.sid)) continue;
-    if (country && other.country && other.country === country) {
+  // Phase 1: when BOTH users have "any" filter and same country, prefer that.
+  if (filter === "any") {
+    for (let i = 0; i < queue.length; i++) {
+      const other = queue[i];
+      if (other.sid === sid) continue;
+      if (isBlocked(sid, other.sid)) continue;
+      if (other.filter !== "any") continue;
+      if (!country || !other.country || other.country !== country) continue;
       queue.splice(i, 1);
       removeFromQueue(sid);
       pair(sid, other.sid);
@@ -183,22 +198,27 @@ function tryMatch(sid) {
     }
   }
 
-  // Phase 2: fallback match — either side has waited long enough, or either side has no country
+  // Phase 2: any filter-compatible match. If both are "any", require the fallback
+  // window so Phase 1 gets a chance to land a same-country pair. Strict filters
+  // bypass the wait — users who set a specific country are opting into a global
+  // pool for that country.
   for (let i = 0; i < queue.length; i++) {
     const other = queue[i];
     if (other.sid === sid) continue;
     if (isBlocked(sid, other.sid)) continue;
-    const meAged = sessions.get(sid)?.queueEnteredAt
-      ? now - sessions.get(sid).queueEnteredAt >= FALLBACK_MS
-      : false;
-    const theyAged = now - other.enteredAt >= FALLBACK_MS;
-    const anyCountryMissing = !country || !other.country;
-    if (meAged || theyAged || anyCountryMissing) {
-      queue.splice(i, 1);
-      removeFromQueue(sid);
-      pair(sid, other.sid);
-      return true;
+    if (!filterCompatible(filter, country, other.filter, other.country)) continue;
+
+    if (filter === "any" && other.filter === "any") {
+      const meAged = meta?.queueEnteredAt ? now - meta.queueEnteredAt >= FALLBACK_MS : false;
+      const theyAged = now - other.enteredAt >= FALLBACK_MS;
+      const anyCountryMissing = !country || !other.country;
+      if (!meAged && !theyAged && !anyCountryMissing) continue;
     }
+
+    queue.splice(i, 1);
+    removeFromQueue(sid);
+    pair(sid, other.sid);
+    return true;
   }
 
   return false;
@@ -207,6 +227,7 @@ function tryMatch(sid) {
 function enqueue(sid) {
   const meta = sessions.get(sid);
   const country = meta?.country || null;
+  const filter  = meta?.filter  || "any";
   const now = Date.now();
   if (meta) meta.queueEnteredAt = now;
 
@@ -214,16 +235,19 @@ function enqueue(sid) {
 
   // Not matched — join the queue
   if (!queue.find((e) => e.sid === sid)) {
-    queue.push({ sid, country, enteredAt: now });
+    queue.push({ sid, country, filter, enteredAt: now });
   }
 
   // Retry once the fallback window elapses, in case no one new joins
   setTimeout(() => {
     if (!queue.find((e) => e.sid === sid)) return; // already matched or left
-    // Walk the rest of the queue looking for any non-blocked pairing
+    const meEntry = sessions.get(sid);
+    const meCountry = meEntry?.country || null;
+    const meFilter  = meEntry?.filter  || "any";
     for (const other of queue) {
       if (other.sid === sid) continue;
       if (isBlocked(sid, other.sid)) continue;
+      if (!filterCompatible(meFilter, meCountry, other.filter, other.country)) continue;
       removeFromQueue(sid);
       removeFromQueue(other.sid);
       pair(sid, other.sid);
@@ -261,6 +285,7 @@ io.on("connection", (socket) => {
     country,
     ip,
     username: null,
+    filter: "any",
     startedAt: Date.now(),
     matches: 0,
     skips: 0,
@@ -268,13 +293,25 @@ io.on("connection", (socket) => {
   logEvent(socket.id, "session_start", { country, ip });
   broadcastPresence();
 
-  socket.on("hello", ({ username } = {}) => {
+  socket.on("hello", ({ username, filter } = {}) => {
     const meta = sessions.get(socket.id);
     if (!meta) return;
     const clean = typeof username === "string" ? username.trim().slice(0, 32) : null;
     if (clean && /^[A-Za-z0-9_]+$/.test(clean)) {
       meta.username = clean;
     }
+    if (typeof filter === "string") {
+      meta.filter = filter === "any" ? "any" : filter.toUpperCase().slice(0, 2);
+    }
+  });
+
+  socket.on("set-filter", ({ filter } = {}) => {
+    const meta = sessions.get(socket.id);
+    if (!meta) return;
+    meta.filter = filter === "any" ? "any" : String(filter || "any").toUpperCase().slice(0, 2);
+    // Update the queue entry if user is currently waiting
+    const entry = queue.find((e) => e.sid === socket.id);
+    if (entry) entry.filter = meta.filter;
   });
 
   socket.on("join-queue", () => {
@@ -387,4 +424,4 @@ io.on("connection", (socket) => {
   });
 });
 
-http.listen(PORT, () => console.log(`[randochat] signaling on :${PORT} (supabase=${!!supabase})`));
+http.listen(PORT, () => console.log(`[randochat] signaling on :${PORT} (supabase=${!!supabase} relay=${!!ADMIN_RELAY_SECRET})`));
