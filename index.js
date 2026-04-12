@@ -3,8 +3,11 @@ import { createServer } from "http";
 import { createClient } from "@supabase/supabase-js";
 
 const PORT = process.env.PORT || 4000;
-const FALLBACK_MS = 10_000; // how long to wait for a same-country match before falling back to global
+const FALLBACK_MS = 10_000;              // same-country match window before falling back to global
 const BAN_REFRESH_MS = 30_000;
+const AUTO_BAN_WINDOW_MS = 10 * 60_000;  // look back 10 minutes
+const AUTO_BAN_THRESHOLD = 3;            // reports in that window → auto-ban
+const ADMIN_RELAY_SECRET = process.env.ADMIN_RELAY_SECRET || null;
 
 const supabase =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -21,6 +24,43 @@ if (!supabase) {
 
 const http = createServer((req, res) => {
   if (req.url === "/health") { res.writeHead(200); res.end("ok"); return; }
+  if (req.url === "/live") {
+    const auth = req.headers["authorization"] || "";
+    if (!ADMIN_RELAY_SECRET || auth !== `Bearer ${ADMIN_RELAY_SECRET}`) {
+      res.writeHead(401); res.end("unauthorized"); return;
+    }
+    const now = Date.now();
+    const list = [];
+    for (const [sid, meta] of sessions) {
+      const partner = partners.get(sid) || null;
+      const state = partner
+        ? "matched"
+        : queue.find((e) => e.sid === sid)
+        ? "searching"
+        : "idle";
+      list.push({
+        sid,
+        country: meta.country,
+        ip: meta.ip,
+        username: meta.username,
+        started_at: new Date(meta.startedAt).toISOString(),
+        uptime_ms: now - meta.startedAt,
+        matches: meta.matches || 0,
+        skips: meta.skips || 0,
+        partner,
+        state,
+      });
+    }
+    list.sort((a, b) => b.uptime_ms - a.uptime_ms);
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({
+      sessions: list,
+      queue_size: queue.length,
+      active_bans: banned.size,
+      now: new Date(now).toISOString(),
+    }));
+    return;
+  }
   res.writeHead(404); res.end();
 });
 const io = new Server(http, { cors: { origin: "*" } });
@@ -280,7 +320,50 @@ io.on("connection", (socket) => {
     logEvent(socket.id, "report", { data: { peer, reason: record.reason, reported_ip: record.reported_ip } });
     if (!supabase) return;
     const { error } = await supabase.from("reports").insert(record);
-    if (error) console.error("[randochat] report insert failed:", error.message);
+    if (error) { console.error("[randochat] report insert failed:", error.message); return; }
+
+    // Auto-ban check: N reports against the same IP within the window → permanent ban
+    if (!record.reported_ip) return;
+    try {
+      const sinceIso = new Date(Date.now() - AUTO_BAN_WINDOW_MS).toISOString();
+      const { count } = await supabase
+        .from("reports")
+        .select("id", { count: "exact", head: true })
+        .eq("reported_ip", record.reported_ip)
+        .gte("created_at", sinceIso);
+      if ((count || 0) < AUTO_BAN_THRESHOLD) return;
+
+      // Skip if already actively banned
+      const { count: activeCount } = await supabase
+        .from("bans")
+        .select("id", { count: "exact", head: true })
+        .eq("ip", record.reported_ip)
+        .eq("active", true);
+      if ((activeCount || 0) > 0) return;
+
+      const reasonText = `auto: ${count} reports in ${AUTO_BAN_WINDOW_MS / 60000}m`;
+      const { error: banError } = await supabase.from("bans").insert({
+        ip: record.reported_ip,
+        reason: reasonText,
+        banned_by: "auto",
+        active: true,
+      });
+      if (banError) { console.error("[auto-ban] insert failed:", banError.message); return; }
+
+      banned.add(record.reported_ip);
+      console.log(`[auto-ban] ${record.reported_ip} — ${reasonText}`);
+
+      // Disconnect the offender immediately if they're still connected
+      for (const [sid, meta] of sessions) {
+        if (meta.ip !== record.reported_ip) continue;
+        const s = io.sockets.sockets.get(sid);
+        if (!s) continue;
+        s.emit("banned", { reason: "Multiple reports received." });
+        s.disconnect(true);
+      }
+    } catch (e) {
+      console.error("[auto-ban] error:", e?.message || e);
+    }
   });
 
   socket.on("gift", ({ type }) => {
