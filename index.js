@@ -267,7 +267,16 @@ function leavePartner(sid, notify = true) {
 }
 
 function broadcastPresence() {
-  io.emit("presence", { online: io.engine.clientsCount });
+  const countries = {};
+  for (const meta of sessions.values()) {
+    const c = meta?.country;
+    if (!c) continue;
+    countries[c] = (countries[c] || 0) + 1;
+  }
+  io.emit("presence", {
+    online: io.engine.clientsCount,
+    countries,
+  });
 }
 
 io.on("connection", (socket) => {
