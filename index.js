@@ -9,6 +9,20 @@ const AUTO_BAN_WINDOW_MS = 10 * 60_000;  // look back 10 minutes
 const AUTO_BAN_THRESHOLD = 3;            // reports in that window → auto-ban
 const ADMIN_RELAY_SECRET = process.env.ADMIN_RELAY_SECRET || null;
 
+// Economy: server-side source of truth, client never decides costs.
+const GIFT_COSTS = {
+  heart: 5,
+  fire:  10,
+  star:  20,
+};
+
+// "Buy coins" packages (TEST MODE — no real payments yet).
+const COIN_PACKAGES = {
+  small:  { coins:   500, label: "$4.99"  },
+  medium: { coins:  2000, label: "$14.99" },
+  big:    { coins: 10000, label: "$49.99" },
+};
+
 const supabase =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
     ? createClient(
@@ -279,6 +293,20 @@ function broadcastPresence() {
   });
 }
 
+async function ensureUserRecord(sid, deviceId, username) {
+  if (!supabase || !deviceId) return;
+  const { data, error } = await supabase.rpc("ensure_user", {
+    p_device: deviceId,
+    p_username: username,
+  });
+  if (error) { console.error("[economy] ensure_user failed:", error.message); return; }
+  const meta = sessions.get(sid);
+  if (!meta) return;
+  meta.userId = data?.id ?? null;
+  meta.balance = data?.balance_cents ?? 0;
+  io.to(sid).emit("balance", { balance: meta.balance });
+}
+
 io.on("connection", (socket) => {
   const country = countryOf(socket);
   const ip = ipOf(socket);
@@ -294,6 +322,9 @@ io.on("connection", (socket) => {
     country,
     ip,
     username: null,
+    deviceId: null,
+    userId: null,
+    balance: 0,
     filter: "any",
     startedAt: Date.now(),
     matches: 0,
@@ -302,7 +333,7 @@ io.on("connection", (socket) => {
   logEvent(socket.id, "session_start", { country, ip });
   broadcastPresence();
 
-  socket.on("hello", ({ username, filter } = {}) => {
+  socket.on("hello", ({ username, filter, deviceId } = {}) => {
     const meta = sessions.get(socket.id);
     if (!meta) return;
     const clean = typeof username === "string" ? username.trim().slice(0, 32) : null;
@@ -311,6 +342,10 @@ io.on("connection", (socket) => {
     }
     if (typeof filter === "string") {
       meta.filter = filter === "any" ? "any" : filter.toUpperCase().slice(0, 2);
+    }
+    if (typeof deviceId === "string" && deviceId.length >= 16 && deviceId.length < 100) {
+      meta.deviceId = deviceId;
+      ensureUserRecord(socket.id, deviceId, meta.username);
     }
   });
 
@@ -412,9 +447,82 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("gift", ({ type }) => {
-    const p = partners.get(socket.id);
-    if (p) io.to(p).emit("gift", { type });
+  socket.on("gift", async ({ type } = {}) => {
+    if (!GIFT_COSTS[type]) {
+      socket.emit("gift-result", { ok: false, error: "unknown gift" });
+      return;
+    }
+    const senderMeta = sessions.get(socket.id);
+    const partnerSid = partners.get(socket.id);
+    const partnerMeta = partnerSid ? sessions.get(partnerSid) : null;
+    if (!senderMeta || !partnerMeta) {
+      socket.emit("gift-result", { ok: false, error: "not in a call" });
+      return;
+    }
+    if (!senderMeta.deviceId || !partnerMeta.deviceId) {
+      socket.emit("gift-result", { ok: false, error: "identity not ready" });
+      return;
+    }
+    if (!supabase) {
+      socket.emit("gift-result", { ok: false, error: "economy disabled (no supabase)" });
+      return;
+    }
+
+    const cost = GIFT_COSTS[type];
+    const { data, error } = await supabase.rpc("send_gift", {
+      p_sender_device:   senderMeta.deviceId,
+      p_receiver_device: partnerMeta.deviceId,
+      p_gift_type:       type,
+      p_amount_cents:    cost,
+    });
+    if (error) {
+      console.warn("[gift] rpc failed:", error.message);
+      socket.emit("gift-result", { ok: false, error: error.message });
+      return;
+    }
+
+    senderMeta.balance = data.sender_balance;
+    partnerMeta.balance = data.receiver_balance;
+
+    socket.emit("gift-result", { ok: true, balance: data.sender_balance });
+    socket.emit("balance", { balance: data.sender_balance });
+
+    io.to(partnerSid).emit("gift", {
+      type,
+      credit: data.receiver_cut,
+    });
+    io.to(partnerSid).emit("balance", { balance: data.receiver_balance });
+  });
+
+  socket.on("buy-coins", async ({ packageId } = {}) => {
+    const pkg = COIN_PACKAGES[packageId];
+    const meta = sessions.get(socket.id);
+    if (!pkg || !meta?.deviceId) {
+      socket.emit("topup-result", { ok: false, error: "bad request" });
+      return;
+    }
+    if (!supabase) {
+      socket.emit("topup-result", { ok: false, error: "economy disabled (no supabase)" });
+      return;
+    }
+    const { data, error } = await supabase.rpc("topup_balance", {
+      p_device:       meta.deviceId,
+      p_amount_cents: pkg.coins,
+      p_note:         `test-topup:${packageId}`,
+    });
+    if (error) {
+      console.warn("[topup] rpc failed:", error.message);
+      socket.emit("topup-result", { ok: false, error: error.message });
+      return;
+    }
+    meta.balance = data.balance_cents;
+    socket.emit("balance", { balance: data.balance_cents });
+    socket.emit("topup-result", { ok: true, balance: data.balance_cents, added: pkg.coins });
+  });
+
+  socket.on("cashout-request", () => {
+    // Placeholder — Phase 3 will wire this to Stripe Connect / crypto payout.
+    socket.emit("cashout-result", { ok: false, error: "cashout not live yet" });
   });
 
   socket.on("disconnect", () => {
