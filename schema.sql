@@ -122,7 +122,7 @@ begin
   end if;
 
   insert into public.users (device_id, username, balance_cents)
-  values (p_device, p_username, 100)  -- 100 coin bootstrap so users can try gifting
+  values (p_device, p_username, 5)  -- 5 coin bootstrap — exactly one heart to try
   on conflict (device_id) do update
     set username     = coalesce(excluded.username, public.users.username),
         last_seen_at = now()
