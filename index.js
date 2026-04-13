@@ -16,12 +16,10 @@ const GIFT_COSTS = {
   star:  20,
 };
 
-// "Buy coins" packages (TEST MODE — no real payments yet).
-const COIN_PACKAGES = {
-  small:  { coins:   500, label: "$4.99"  },
-  medium: { coins:  2000, label: "$14.99" },
-  big:    { coins: 10000, label: "$49.99" },
-};
+// Purchases are now handled manually — user sends payment off-platform,
+// admin credits coins via the admin dashboard. Automatic buy is disabled.
+const CASHOUT_MIN_COINS = 5_000;         // user can't cash out below this
+const CASHOUT_MAX_REQUESTS_OPEN = 2;     // per-user cap on pending requests
 
 const supabase =
   process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -494,35 +492,77 @@ io.on("connection", (socket) => {
     io.to(partnerSid).emit("balance", { balance: data.receiver_balance });
   });
 
-  socket.on("buy-coins", async ({ packageId } = {}) => {
-    const pkg = COIN_PACKAGES[packageId];
+  socket.on("cashout-request", async ({ amount, method, destination, note } = {}) => {
     const meta = sessions.get(socket.id);
-    if (!pkg || !meta?.deviceId) {
-      socket.emit("topup-result", { ok: false, error: "bad request" });
+    if (!meta?.deviceId) {
+      socket.emit("cashout-result", { ok: false, error: "identity not ready" });
       return;
     }
     if (!supabase) {
-      socket.emit("topup-result", { ok: false, error: "economy disabled (no supabase)" });
+      socket.emit("cashout-result", { ok: false, error: "economy disabled (no supabase)" });
       return;
     }
-    const { data, error } = await supabase.rpc("topup_balance", {
-      p_device:       meta.deviceId,
-      p_amount_cents: pkg.coins,
-      p_note:         `test-topup:${packageId}`,
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt < CASHOUT_MIN_COINS) {
+      socket.emit("cashout-result", { ok: false, error: `minimum ${CASHOUT_MIN_COINS} coins` });
+      return;
+    }
+    if (!["paypal", "crypto", "bank", "other"].includes(method)) {
+      socket.emit("cashout-result", { ok: false, error: "invalid method" });
+      return;
+    }
+    const destClean = String(destination || "").trim().slice(0, 256);
+    if (destClean.length < 3) {
+      socket.emit("cashout-result", { ok: false, error: "destination required" });
+      return;
+    }
+
+    // Limit how many pending requests a user can stack
+    const { count: openCount } = await supabase
+      .from("cashout_requests")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "pending")
+      .eq("user_id", meta.userId || -1);
+    if ((openCount || 0) >= CASHOUT_MAX_REQUESTS_OPEN) {
+      socket.emit("cashout-result", { ok: false, error: "too many pending requests" });
+      return;
+    }
+
+    const { data, error } = await supabase.rpc("create_cashout_request", {
+      p_device:      meta.deviceId,
+      p_amount:      amt,
+      p_method:      method,
+      p_destination: destClean,
+      p_note:        note || null,
     });
     if (error) {
-      console.warn("[topup] rpc failed:", error.message);
-      socket.emit("topup-result", { ok: false, error: error.message });
+      console.warn("[cashout] rpc failed:", error.message);
+      socket.emit("cashout-result", { ok: false, error: error.message });
       return;
     }
     meta.balance = data.balance_cents;
+    socket.emit("cashout-result", { ok: true, requestId: data.request_id, balance: data.balance_cents });
     socket.emit("balance", { balance: data.balance_cents });
-    socket.emit("topup-result", { ok: true, balance: data.balance_cents, added: pkg.coins });
   });
 
-  socket.on("cashout-request", () => {
-    // Placeholder — Phase 3 will wire this to Stripe Connect / crypto payout.
-    socket.emit("cashout-result", { ok: false, error: "cashout not live yet" });
+  socket.on("my-cashouts", async () => {
+    const meta = sessions.get(socket.id);
+    if (!meta?.userId || !supabase) {
+      socket.emit("my-cashouts", { rows: [] });
+      return;
+    }
+    const { data, error } = await supabase
+      .from("cashout_requests")
+      .select("id, amount_cents, method, destination, note, status, admin_note, created_at, processed_at")
+      .eq("user_id", meta.userId)
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (error) {
+      console.warn("[cashout-history] failed:", error.message);
+      socket.emit("my-cashouts", { rows: [] });
+      return;
+    }
+    socket.emit("my-cashouts", { rows: data || [] });
   });
 
   socket.on("disconnect", () => {
